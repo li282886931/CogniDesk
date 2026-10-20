@@ -1,0 +1,9 @@
+.superpowers/
+node_modules/
+dist/
+coverage/
+.DS_Store
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.db
