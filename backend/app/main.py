@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sqlite3
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -10,6 +9,8 @@ from typing import Any, Dict, Generator, Optional
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from .database import Connection, connect
+from .llm import LocalLlamaClient
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -46,63 +47,62 @@ class TicketInput(BaseModel):
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS customers (
-    customer_id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    channel TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    customer_id VARCHAR(64) PRIMARY KEY,
+    name VARCHAR(80) NOT NULL,
+    channel VARCHAR(32) NOT NULL,
+    created_at VARCHAR(40) NOT NULL
 );
 CREATE TABLE IF NOT EXISTS sessions (
-    session_id TEXT PRIMARY KEY,
-    customer_id TEXT NOT NULL,
-    channel TEXT NOT NULL,
-    status TEXT NOT NULL,
-    assignee_name TEXT,
-    transfer_reason TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
+    session_id VARCHAR(64) PRIMARY KEY,
+    customer_id VARCHAR(64) NOT NULL,
+    channel VARCHAR(32) NOT NULL,
+    status VARCHAR(32) NOT NULL,
+    assignee_name VARCHAR(80),
+    transfer_reason VARCHAR(64),
+    created_at VARCHAR(40) NOT NULL,
+    updated_at VARCHAR(40) NOT NULL,
     FOREIGN KEY(customer_id) REFERENCES customers(customer_id)
 );
 CREATE TABLE IF NOT EXISTS messages (
-    message_id TEXT PRIMARY KEY,
-    session_id TEXT NOT NULL,
-    client_msg_id TEXT NOT NULL,
-    sender_type TEXT NOT NULL,
+    message_id VARCHAR(64) PRIMARY KEY,
+    session_id VARCHAR(64) NOT NULL,
+    client_msg_id VARCHAR(128) NOT NULL,
+    sender_type VARCHAR(16) NOT NULL,
     content TEXT NOT NULL,
-    msg_type TEXT NOT NULL,
-    created_at TEXT NOT NULL,
+    msg_type VARCHAR(16) NOT NULL,
+    created_at VARCHAR(40) NOT NULL,
     UNIQUE(session_id, client_msg_id),
     FOREIGN KEY(session_id) REFERENCES sessions(session_id)
 );
 CREATE TABLE IF NOT EXISTS tickets (
-    ticket_id TEXT PRIMARY KEY,
-    session_id TEXT NOT NULL,
-    title TEXT NOT NULL,
-    category TEXT NOT NULL,
-    priority TEXT NOT NULL,
-    status TEXT NOT NULL,
+    ticket_id VARCHAR(64) PRIMARY KEY,
+    session_id VARCHAR(64) NOT NULL,
+    title VARCHAR(160) NOT NULL,
+    category VARCHAR(80) NOT NULL,
+    priority VARCHAR(8) NOT NULL,
+    status VARCHAR(32) NOT NULL,
     summary TEXT NOT NULL,
-    sla_due_at TEXT NOT NULL,
-    created_at TEXT NOT NULL,
+    sla_due_at VARCHAR(40) NOT NULL,
+    created_at VARCHAR(40) NOT NULL,
     FOREIGN KEY(session_id) REFERENCES sessions(session_id)
 );
 CREATE TABLE IF NOT EXISTS audit_events (
-    event_id TEXT PRIMARY KEY,
-    session_id TEXT NOT NULL,
-    event_type TEXT NOT NULL,
-    detail TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    event_id VARCHAR(64) PRIMARY KEY,
+    session_id VARCHAR(64) NOT NULL,
+    event_type VARCHAR(64) NOT NULL,
+    detail VARCHAR(255) NOT NULL,
+    created_at VARCHAR(40) NOT NULL
 );
 """
 
 
-def create_app(database_path: Optional[Path] = None) -> FastAPI:
-    path = database_path or Path(__file__).parent.parent / "support.db"
+def create_app(database_path: Optional[Path] = None, llm_client: Optional[LocalLlamaClient] = None) -> FastAPI:
     app = FastAPI(title="Support Console API", version="0.1.0")
+    model_client = llm_client or LocalLlamaClient()
 
     @contextmanager
-    def db() -> Generator[sqlite3.Connection, None, None]:
-        connection = sqlite3.connect(path)
-        connection.row_factory = sqlite3.Row
+    def db() -> Generator[Connection, None, None]:
+        connection = connect(database_path)
         connection.executescript(SCHEMA)
         try:
             yield connection
@@ -110,12 +110,12 @@ def create_app(database_path: Optional[Path] = None) -> FastAPI:
         finally:
             connection.close()
 
-    def session_payload(row: sqlite3.Row) -> Dict[str, Any]:
+    def session_payload(row: Dict[str, Any]) -> Dict[str, Any]:
         payload = dict(row)
         payload["customer_name"] = payload.pop("name")
         return payload
 
-    def get_session(connection: sqlite3.Connection, session_id: str) -> sqlite3.Row:
+    def get_session(connection: Connection, session_id: str) -> Dict[str, Any]:
         row = connection.execute(
             """
             SELECT s.*, c.name
@@ -128,13 +128,13 @@ def create_app(database_path: Optional[Path] = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="session not found")
         return row
 
-    def add_audit(connection: sqlite3.Connection, session_id: str, event_type: str, detail: str) -> None:
+    def add_audit(connection: Connection, session_id: str, event_type: str, detail: str) -> None:
         connection.execute(
             "INSERT INTO audit_events VALUES (?, ?, ?, ?, ?)",
             (f"evt_{uuid.uuid4().hex[:12]}", session_id, event_type, detail, now()),
         )
 
-    def transfer(connection: sqlite3.Connection, session_id: str, reason: str) -> sqlite3.Row:
+    def transfer(connection: Connection, session_id: str, reason: str) -> Dict[str, Any]:
         current = get_session(connection, session_id)
         if current["status"] != "HUMAN_HANDLING":
             timestamp = now()
@@ -145,14 +145,23 @@ def create_app(database_path: Optional[Path] = None) -> FastAPI:
             add_audit(connection, session_id, "TRANSFER_TO_HUMAN", reason)
         return get_session(connection, session_id)
 
-    def route_customer_message(content: str) -> Dict[str, str]:
+    def route_customer_message(content: str) -> Dict[str, Any]:
         normalized = content.lower()
         if any(keyword in normalized for keyword in ("退款", "改密", "身份证", "人工", "投诉")):
             return {"handler": "human", "reason": "sensitive_intent"}
         if any(keyword in normalized for keyword in ("生气", "愤怒", "差评")):
             return {"handler": "human", "reason": "negative_sentiment"}
         if any(keyword in normalized for keyword in ("发货", "物流", "订单")):
-            return {"handler": "robot", "reply": "已根据订单物流知识为您检索。若超过承诺时效未更新，我会立即为您转人工处理。"}
+            source = "订单物流服务规范 v1.0"
+            generated = model_client.answer(
+                question=content,
+                context="已发布知识：订单物流服务规范 v1.0。物流超过承诺时效时，可协助客户转人工核查。",
+            )
+            return {
+                "handler": "robot",
+                "reply": generated or "已根据订单物流知识为您检索。若超过承诺时效未更新，我会立即为您转人工处理。",
+                "source": source,
+            }
         return {"handler": "robot", "reply": "暂未找到可引用的已发布知识。我可以现在为您转接人工客服继续处理。"}
 
     @app.get("/api/v1/health")
