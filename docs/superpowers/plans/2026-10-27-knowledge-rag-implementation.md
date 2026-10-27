@@ -115,14 +115,14 @@ Expected: all tests pass.
 - Modify: `backend/tests/test_knowledge_flow.py`
 - Create: `backend/tests/test_rag_flow.py`
 
-- [ ] **Step 1: Add failing tests for publish indexing and evidence-bearing replies**
-- [ ] **Step 2: Verify failures**
-- [ ] **Step 3: Inject vector store and embedding provider into `create_app`**
-- [ ] **Step 4: Index only the published version and roll back publication when indexing fails**
-- [ ] **Step 5: Replace hardcoded FAQ context with search results**
-- [ ] **Step 6: Return `evidence`, `confidence`, and `handoff_required`**
-- [ ] **Step 7: Add low-confidence refusal and `low_confidence` human transfer**
-- [ ] **Step 8: Run the complete backend suite**
+- [x] **Step 1: Add failing tests for publish indexing and evidence-bearing replies**
+- [x] **Step 2: Verify failures**
+- [x] **Step 3: Inject vector store and embedding provider into `create_app`**
+- [x] **Step 4: Index only the published version and roll back publication when indexing fails**
+- [x] **Step 5: Replace hardcoded FAQ context with search results**
+- [x] **Step 6: Return `evidence`, `confidence`, and `handoff_required`**
+- [x] **Step 7: Add low-confidence refusal and `low_confidence` human transfer**
+- [x] **Step 8: Run the complete backend suite**
 
 ### Task 4: Evidence persistence and audit queries
 
@@ -130,12 +130,12 @@ Expected: all tests pass.
 - Modify: `backend/app/main.py`
 - Modify: `backend/tests/test_rag_flow.py`
 
-- [ ] **Step 1: Add failing tests for `message_evidence` snapshots and audit retrieval**
-- [ ] **Step 2: Verify failures**
-- [ ] **Step 3: Add the evidence table and save immutable evidence snapshots**
-- [ ] **Step 4: Add `GET /api/v1/knowledge/{id}/evidence`**
-- [ ] **Step 5: Add audit events for create, publish, archive, and citation**
-- [ ] **Step 6: Run backend tests and `git diff --check`**
+- [x] **Step 1: Add failing tests for `message_evidence` snapshots and audit retrieval**
+- [x] **Step 2: Verify failures**
+- [x] **Step 3: Add the evidence table and save immutable evidence snapshots**
+- [x] **Step 4: Add `GET /api/v1/knowledge/{id}/evidence`**
+- [x] **Step 5: Add audit events for create, publish, archive, and citation**
+- [x] **Step 6: Run backend tests and `git diff --check`**
 
 ### Task 5: Knowledge management and evidence UI
 

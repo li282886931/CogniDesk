@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -10,7 +11,9 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from .database import Connection, connect
+from .embeddings import DeterministicEmbeddingProvider, EmbeddingProvider
 from .llm import LocalLlamaClient
+from .vector_store import InMemoryKnowledgeStore, KnowledgeVectorStore, MilvusKnowledgeStore
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -134,12 +137,32 @@ CREATE TABLE IF NOT EXISTS knowledge_versions (
     UNIQUE(knowledge_id, version),
     FOREIGN KEY(knowledge_id) REFERENCES knowledge_items(knowledge_id)
 );
+CREATE TABLE IF NOT EXISTS message_evidence (
+    evidence_id VARCHAR(64) PRIMARY KEY,
+    message_id VARCHAR(64) NOT NULL,
+    knowledge_id VARCHAR(64) NOT NULL,
+    version INTEGER NOT NULL,
+    chunk_text TEXT NOT NULL,
+    score DECIMAL(8, 6) NOT NULL,
+    created_at VARCHAR(40) NOT NULL,
+    FOREIGN KEY(message_id) REFERENCES messages(message_id),
+    FOREIGN KEY(knowledge_id) REFERENCES knowledge_items(knowledge_id)
+);
 """
 
 
-def create_app(database_path: Optional[Path] = None, llm_client: Optional[LocalLlamaClient] = None) -> FastAPI:
+def create_app(
+    database_path: Optional[Path] = None,
+    llm_client: Optional[LocalLlamaClient] = None,
+    vector_store: Optional[KnowledgeVectorStore] = None,
+    embedding_provider: Optional[EmbeddingProvider] = None,
+) -> FastAPI:
     app = FastAPI(title="Support Console API", version="0.1.0")
     model_client = llm_client or LocalLlamaClient()
+    knowledge_store = vector_store or (InMemoryKnowledgeStore() if database_path is not None else MilvusKnowledgeStore())
+    embedding = embedding_provider or DeterministicEmbeddingProvider(
+        dimension=getattr(getattr(knowledge_store, "config", None), "dimension", 32)
+    )
 
     @contextmanager
     def db() -> Generator[Connection, None, None]:
@@ -148,6 +171,9 @@ def create_app(database_path: Optional[Path] = None, llm_client: Optional[LocalL
         try:
             yield connection
             connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
         finally:
             connection.close()
 
@@ -204,21 +230,77 @@ def create_app(database_path: Optional[Path] = None, llm_client: Optional[LocalL
     def route_customer_message(content: str) -> Dict[str, Any]:
         normalized = content.lower()
         if any(keyword in normalized for keyword in ("退款", "改密", "身份证", "人工", "投诉")):
-            return {"handler": "human", "reason": "sensitive_intent"}
-        if any(keyword in normalized for keyword in ("生气", "愤怒", "差评")):
-            return {"handler": "human", "reason": "negative_sentiment"}
-        if any(keyword in normalized for keyword in ("发货", "物流", "订单")):
-            source = "订单物流服务规范 v1.0"
-            generated = model_client.answer(
-                question=content,
-                context="已发布知识：订单物流服务规范 v1.0。物流超过承诺时效时，可协助客户转人工核查。",
-            )
             return {
-                "handler": "robot",
-                "reply": generated or "已根据订单物流知识为您检索。若超过承诺时效未更新，我会立即为您转人工处理。",
-                "source": source,
+                "handler": "human",
+                "reason": "sensitive_intent",
+                "reply": None,
+                "evidence": [],
+                "handoff_required": True,
             }
-        return {"handler": "robot", "reply": "暂未找到可引用的已发布知识。我可以现在为您转接人工客服继续处理。"}
+        if any(keyword in normalized for keyword in ("生气", "愤怒", "差评")):
+            return {
+                "handler": "human",
+                "reason": "negative_sentiment",
+                "reply": None,
+                "evidence": [],
+                "handoff_required": True,
+            }
+
+        safe_refusal = "暂未找到可以确认该问题的已发布知识。我可以为您转接人工客服继续处理。"
+        try:
+            candidates = knowledge_store.search(embedding.embed(content), limit=5)
+        except Exception:
+            return {
+                "handler": "human",
+                "reason": "low_confidence",
+                "reply": safe_refusal,
+                "evidence": [],
+                "confidence": 0.0,
+                "handoff_required": True,
+            }
+        minimum_score = float(os.getenv("RAG_MIN_SCORE", "0.78"))
+        if not candidates or candidates[0]["score"] < minimum_score:
+            return {
+                "handler": "human",
+                "reason": "low_confidence",
+                "reply": safe_refusal,
+                "evidence": [],
+                "confidence": candidates[0]["score"] if candidates else 0.0,
+                "handoff_required": True,
+            }
+
+        evidence = [
+            {
+                "knowledge_id": item["knowledge_id"],
+                "title": item["title"],
+                "version": item["version"],
+                "chunk_text": item["content"],
+                "source": item["source"],
+                "score": item["score"],
+            }
+            for item in candidates
+        ]
+        context = "\n\n".join(
+            f"来源：{item['title']} v{item['version']}\n内容：{item['content']}"
+            for item in candidates
+        )
+        generated = model_client.answer(question=content, context=context)
+        if not generated:
+            return {
+                "handler": "human",
+                "reason": "low_confidence",
+                "reply": safe_refusal,
+                "evidence": evidence,
+                "confidence": candidates[0]["score"],
+                "handoff_required": True,
+            }
+        return {
+            "handler": "robot",
+            "reply": generated,
+            "evidence": evidence,
+            "confidence": candidates[0]["score"],
+            "handoff_required": False,
+        }
 
     @app.get("/api/v1/health")
     def health() -> Dict[str, Any]:
@@ -274,6 +356,24 @@ def create_app(database_path: Optional[Path] = None, llm_client: Optional[LocalL
             knowledge = get_knowledge(connection, knowledge_id)
         return response(knowledge)
 
+    @app.get("/api/v1/knowledge/{knowledge_id}/evidence")
+    def list_knowledge_evidence(knowledge_id: str) -> Dict[str, Any]:
+        with db() as connection:
+            get_knowledge(connection, knowledge_id)
+            rows = connection.execute(
+                """
+                SELECT e.*, k.title, v.source_note
+                FROM message_evidence e
+                JOIN knowledge_items k ON k.knowledge_id = e.knowledge_id
+                JOIN knowledge_versions v
+                  ON v.knowledge_id = e.knowledge_id AND v.version = e.version
+                WHERE e.knowledge_id = ?
+                ORDER BY e.created_at DESC
+                """,
+                (knowledge_id,),
+            ).fetchall()
+        return response([dict(row) for row in rows])
+
     @app.post("/api/v1/knowledge/{knowledge_id}/versions")
     def create_knowledge_version(knowledge_id: str, payload: KnowledgeVersionInput) -> Dict[str, Any]:
         version_id = f"knv_{uuid.uuid4().hex[:12]}"
@@ -313,6 +413,21 @@ def create_app(database_path: Optional[Path] = None, llm_client: Optional[LocalL
                 return response(knowledge)
             if selected["status"] != "DRAFT":
                 raise HTTPException(status_code=409, detail="knowledge version cannot be published")
+            try:
+                knowledge_store.index_version(
+                    knowledge_id=knowledge_id,
+                    version=payload.version,
+                    title=knowledge["title"],
+                    content=selected["content"],
+                    source=f"{knowledge['title']} v{payload.version}",
+                    vector=embedding.embed(f"{knowledge['title']}\n{selected['content']}"),
+                )
+            except Exception:
+                raise HTTPException(status_code=503, detail="knowledge index unavailable") from None
+            previous_published = next(
+                (version for version in knowledge["versions"] if version["status"] == "PUBLISHED"),
+                None,
+            )
             connection.execute(
                 "UPDATE knowledge_versions SET status = ?, effective_from = ? WHERE knowledge_id = ? AND status = ?",
                 ("ARCHIVED", timestamp, knowledge_id, "PUBLISHED"),
@@ -330,6 +445,12 @@ def create_app(database_path: Optional[Path] = None, llm_client: Optional[LocalL
                 ("PUBLISHED", payload.version, "local-admin", timestamp, knowledge_id),
             )
             add_audit(connection, "system", "KNOWLEDGE_PUBLISHED", f"{knowledge_id}:v{payload.version}")
+            if previous_published and previous_published["version"] != payload.version:
+                try:
+                    knowledge_store.delete_version(knowledge_id, previous_published["version"])
+                except Exception:
+                    knowledge_store.delete_version(knowledge_id, payload.version)
+                    raise HTTPException(status_code=503, detail="knowledge index unavailable") from None
             published = get_knowledge(connection, knowledge_id)
         return response(published)
 
@@ -411,20 +532,63 @@ def create_app(database_path: Optional[Path] = None, llm_client: Optional[LocalL
             )
             handler = "agent"
             reply = None
+            evidence = []
+            confidence = None
+            handoff_required = False
+            reply_message_id = None
             if payload.sender_type == "customer":
                 route = route_customer_message(payload.content)
                 handler = route["handler"]
+                reply = route.get("reply")
+                evidence = route.get("evidence", [])
+                confidence = route.get("confidence")
+                handoff_required = route.get("handoff_required", handler == "human")
                 if handler == "human":
                     session = transfer(connection, session_id, route["reason"])
-                else:
-                    reply = route["reply"]
+                if reply:
+                    reply_message_id = f"msg_{uuid.uuid4().hex[:12]}"
                     connection.execute(
                         "INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        (f"msg_{uuid.uuid4().hex[:12]}", session_id, f"robot_{uuid.uuid4().hex[:12]}", "robot", reply, "text", now()),
+                        (reply_message_id, session_id, f"robot_{uuid.uuid4().hex[:12]}", "robot", reply, "text", now()),
                     )
+                    for item in evidence:
+                        connection.execute(
+                            """
+                            INSERT INTO message_evidence
+                            (evidence_id, message_id, knowledge_id, version, chunk_text, score, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                f"ev_{uuid.uuid4().hex[:12]}",
+                                reply_message_id,
+                                item["knowledge_id"],
+                                item["version"],
+                                item["chunk_text"],
+                                item["score"],
+                                now(),
+                            ),
+                        )
+                        add_audit(
+                            connection,
+                            session_id,
+                            "KNOWLEDGE_CITED",
+                            f"{item['knowledge_id']}:v{item['version']}",
+                        )
                     connection.execute("UPDATE sessions SET updated_at = ? WHERE session_id = ?", (now(), session_id))
             session = get_session(connection, session_id)
-        return response({"message_id": message_id, "session_id": session_id, "handler": handler, "reply": reply, "session": session_payload(session)})
+        return response(
+            {
+                "message_id": message_id,
+                "session_id": session_id,
+                "handler": handler,
+                "reply": reply,
+                "reply_message_id": reply_message_id,
+                "evidence": evidence,
+                "confidence": confidence,
+                "handoff_required": handoff_required,
+                "session": session_payload(session),
+            }
+        )
 
     @app.post("/api/v1/sessions/{session_id}/transfer")
     def transfer_to_human(session_id: str, payload: TransferInput) -> Dict[str, Any]:

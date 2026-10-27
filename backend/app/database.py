@@ -59,6 +59,9 @@ class Connection:
     def commit(self) -> None:
         self.raw.commit()
 
+    def rollback(self) -> None:
+        self.raw.rollback()
+
     def close(self) -> None:
         self.raw.close()
 
