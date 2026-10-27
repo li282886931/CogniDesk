@@ -145,12 +145,12 @@ Expected: all tests pass.
 - Modify: `frontend/src/styles.css`
 - Create: `frontend/src/knowledge.test.tsx`
 
-- [ ] **Step 1: Add failing component/API tests for list, publish, archive, and evidence rendering**
-- [ ] **Step 2: Verify failures**
-- [ ] **Step 3: Add typed knowledge API functions**
-- [ ] **Step 4: Add a working knowledge view and navigation state**
-- [ ] **Step 5: Render real evidence on robot messages and explicit handoff state on refusal**
-- [ ] **Step 6: Run frontend tests and production build**
+- [x] **Step 1: Add failing component/API tests for list, publish, archive, and evidence rendering**
+- [x] **Step 2: Verify failures**
+- [x] **Step 3: Add typed knowledge API functions**
+- [x] **Step 4: Add a working knowledge view and navigation state**
+- [x] **Step 5: Render real evidence on robot messages and explicit handoff state on refusal**
+- [x] **Step 6: Run frontend tests and production build**
 
 ### Task 6: End-to-end verification and documentation
 
