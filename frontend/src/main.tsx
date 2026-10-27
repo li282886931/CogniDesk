@@ -68,7 +68,7 @@ export function App() {
       if (list.length) {
         const detail = await api.getSession(list[0].session_id);
         setSelected(detail);
-        setEvidence([]);
+        setEvidence(detail.messages?.flatMap((item) => item.evidence ?? []) ?? []);
         setNotice("已同步本地服务数据。");
       }
     } catch {
@@ -83,8 +83,9 @@ export function App() {
   async function selectSession(session: Session) {
     if (session.session_id === "local-preview") return;
     try {
-      setSelected(await api.getSession(session.session_id));
-      setEvidence([]);
+      const detail = await api.getSession(session.session_id);
+      setSelected(detail);
+      setEvidence(detail.messages?.flatMap((item) => item.evidence ?? []) ?? []);
     } catch {
       setNotice("无法加载该会话详情。");
     }

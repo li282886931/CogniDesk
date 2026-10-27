@@ -1,6 +1,6 @@
 # CogniDesk
 
-企业级在线客服与智能客服平台的一期可运行版本。系统提供客服坐席工作台、统一会话、机器人分流、转人工、工单、审计和运营指标，并预留 RAG 知识库能力。
+企业级在线客服与智能客服平台的一期可运行版本。系统提供客服坐席工作台、统一会话、机器人分流、转人工、工单、审计、运营指标和可追溯 RAG 知识库能力。
 
 ## 功能范围
 
@@ -10,6 +10,7 @@
 - 工单处理：创建 P1/P2/P3 工单，自动计算 SLA 截止时间。
 - 审计记录：会话创建、转人工和工单创建写入审计事件。
 - 运营指标：进行中会话、待人工接入、待处理工单、AI 解决率和满意度。
+- 知识库与 RAG：管理文本知识、版本和发布状态，机器人仅基于已发布知识生成回复并返回来源证据。
 - 基础向量层：通过 Docker Compose 部署 Milvus standalone，为知识库向量检索提供基础设施。
 
 ## 架构
@@ -72,6 +73,8 @@ LLAMA_TIMEOUT_SECONDS=30
 MILVUS_HOST=127.0.0.1
 MILVUS_PORT=19530
 MILVUS_COLLECTION=customer_support_knowledge
+EMBEDDING_DIMENSION=32
+RAG_MIN_SCORE=0.78
 
 MINIO_ROOT_USER=root
 MINIO_ROOT_PASSWORD=<Milvus 专用 MinIO 密码>
@@ -162,6 +165,30 @@ curl http://127.0.0.1:8080/v1/models
 - 移除 `<think>...</think>` 内容；
 - 模型不可用或超时时回退到安全话术。
 
+## 知识库与 RAG
+
+知识条目默认以草稿保存，只有发布成功且向量索引建立完成后才会参与机器人检索。新版本发布会归档旧版本并删除旧向量；停用知识不会继续参与检索。
+
+创建知识草稿：
+
+```bash
+curl -X POST http://127.0.0.1:8001/api/v1/knowledge \
+  -H 'Content-Type: application/json' \
+  -d '{"title":"订单物流服务规范","category":"物流","content":"物流状态会在承诺时效内更新。","source_note":"客服运营部"}'
+```
+
+发布版本并建立向量索引：
+
+```bash
+curl -X POST http://127.0.0.1:8001/api/v1/knowledge/<knowledge_id>/publish \
+  -H 'Content-Type: application/json' \
+  -d '{"version":1}'
+```
+
+客户问题命中已发布知识时，回复会返回 `evidence`、`confidence` 和 `handoff_required`。检索无命中、低于 `RAG_MIN_SCORE`、向量服务不可用或模型无有效输出时，系统拒答并转人工，不生成无来源的事实。
+
+当前默认 embedding 是稳定的本地开发实现，适合测试和本地闭环验证，不等同于生产级语义模型。后续可通过 `EmbeddingProvider` 接入实际 embedding 服务，保持知识发布和检索接口不变。
+
 ## API
 
 统一响应格式：
@@ -187,6 +214,13 @@ curl http://127.0.0.1:8080/v1/models
 | POST | `/api/v1/sessions/{id}/transfer` | 转人工 |
 | POST | `/api/v1/tickets` | 创建工单并计算 SLA |
 | GET | `/api/v1/dashboard` | 查询运营指标 |
+| POST | `/api/v1/knowledge` | 创建知识草稿 |
+| GET | `/api/v1/knowledge` | 查询知识，可按状态/分类筛选 |
+| GET | `/api/v1/knowledge/{id}` | 查询知识及版本 |
+| POST | `/api/v1/knowledge/{id}/versions` | 创建新草稿版本 |
+| POST | `/api/v1/knowledge/{id}/publish` | 发布版本并建立向量索引 |
+| POST | `/api/v1/knowledge/{id}/archive` | 停用知识 |
+| GET | `/api/v1/knowledge/{id}/evidence` | 查询知识被回复引用的证据快照 |
 
 创建会话示例：
 

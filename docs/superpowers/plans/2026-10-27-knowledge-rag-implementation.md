@@ -159,7 +159,7 @@ Expected: all tests pass.
 - Modify: `docs/superpowers/specs/2026-10-27-knowledge-rag-design.md`
 - Create: `backend/tests/test_knowledge_rag_integration.py`
 
-- [ ] **Step 1: Add the complete create → publish → ask → cite integration test**
-- [ ] **Step 2: Run backend and frontend verification commands**
-- [ ] **Step 3: Document local embedding configuration, Milvus readiness, and safe refusal behavior**
-- [ ] **Step 4: Confirm no credentials or generated database/volume files are tracked**
+- [x] **Step 1: Add the complete create → publish → ask → cite integration test**
+- [x] **Step 2: Run backend and frontend verification commands**
+- [x] **Step 3: Document local embedding configuration, Milvus readiness, and safe refusal behavior**
+- [x] **Step 4: Confirm no credentials or generated database/volume files are tracked**

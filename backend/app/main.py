@@ -510,8 +510,30 @@ def create_app(
                 "SELECT * FROM tickets WHERE session_id = ? ORDER BY created_at DESC",
                 (session_id,),
             ).fetchall()
+            evidence_rows = connection.execute(
+                """
+                SELECT e.*, k.title, v.source_note
+                FROM message_evidence e
+                JOIN messages m ON m.message_id = e.message_id
+                JOIN knowledge_items k ON k.knowledge_id = e.knowledge_id
+                JOIN knowledge_versions v
+                  ON v.knowledge_id = e.knowledge_id AND v.version = e.version
+                WHERE m.session_id = ?
+                ORDER BY e.created_at
+                """,
+                (session_id,),
+            ).fetchall()
         data = session_payload(row)
-        data["messages"] = [dict(message) for message in messages]
+        evidence_by_message: dict[str, list[dict[str, Any]]] = {}
+        for evidence in evidence_rows:
+            evidence_data = dict(evidence)
+            message_id = evidence_data.pop("message_id")
+            evidence_by_message.setdefault(message_id, []).append(evidence_data)
+        data["messages"] = []
+        for message in messages:
+            message_data = dict(message)
+            message_data["evidence"] = evidence_by_message.get(message_data["message_id"], [])
+            data["messages"].append(message_data)
         data["tickets"] = [dict(ticket) for ticket in tickets]
         return response(data)
 

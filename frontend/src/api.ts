@@ -17,6 +17,7 @@ export type Message = {
   sender_type: "customer" | "robot" | "agent" | "system";
   content: string;
   created_at: string;
+  evidence?: KnowledgeEvidence[];
 };
 
 export type Ticket = {
