@@ -45,6 +45,22 @@ class TicketInput(BaseModel):
     summary: str = Field(min_length=1, max_length=2000)
 
 
+class KnowledgeInput(BaseModel):
+    title: str = Field(min_length=1, max_length=160)
+    category: str = Field(min_length=1, max_length=80)
+    content: str = Field(min_length=1, max_length=20000)
+    source_note: Optional[str] = Field(default=None, max_length=255)
+
+
+class KnowledgeVersionInput(BaseModel):
+    content: str = Field(min_length=1, max_length=20000)
+    source_note: Optional[str] = Field(default=None, max_length=255)
+
+
+class KnowledgePublishInput(BaseModel):
+    version: int = Field(ge=1)
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS customers (
     customer_id VARCHAR(64) PRIMARY KEY,
@@ -88,10 +104,35 @@ CREATE TABLE IF NOT EXISTS tickets (
 );
 CREATE TABLE IF NOT EXISTS audit_events (
     event_id VARCHAR(64) PRIMARY KEY,
-    session_id VARCHAR(64) NOT NULL,
+    session_id VARCHAR(64),
     event_type VARCHAR(64) NOT NULL,
     detail VARCHAR(255) NOT NULL,
     created_at VARCHAR(40) NOT NULL
+);
+CREATE TABLE IF NOT EXISTS knowledge_items (
+    knowledge_id VARCHAR(64) PRIMARY KEY,
+    title VARCHAR(160) NOT NULL,
+    category VARCHAR(80) NOT NULL,
+    status VARCHAR(24) NOT NULL,
+    current_version INTEGER NOT NULL,
+    created_by VARCHAR(64) NOT NULL,
+    updated_by VARCHAR(64) NOT NULL,
+    created_at VARCHAR(40) NOT NULL,
+    updated_at VARCHAR(40) NOT NULL
+);
+CREATE TABLE IF NOT EXISTS knowledge_versions (
+    version_id VARCHAR(64) PRIMARY KEY,
+    knowledge_id VARCHAR(64) NOT NULL,
+    version INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    status VARCHAR(24) NOT NULL,
+    source_note VARCHAR(255),
+    effective_from VARCHAR(40),
+    effective_until VARCHAR(40),
+    created_by VARCHAR(64) NOT NULL,
+    created_at VARCHAR(40) NOT NULL,
+    UNIQUE(knowledge_id, version),
+    FOREIGN KEY(knowledge_id) REFERENCES knowledge_items(knowledge_id)
 );
 """
 
@@ -128,7 +169,7 @@ def create_app(database_path: Optional[Path] = None, llm_client: Optional[LocalL
             raise HTTPException(status_code=404, detail="session not found")
         return row
 
-    def add_audit(connection: Connection, session_id: str, event_type: str, detail: str) -> None:
+    def add_audit(connection: Connection, session_id: Optional[str], event_type: str, detail: str) -> None:
         connection.execute(
             "INSERT INTO audit_events VALUES (?, ?, ?, ?, ?)",
             (f"evt_{uuid.uuid4().hex[:12]}", session_id, event_type, detail, now()),
@@ -144,6 +185,21 @@ def create_app(database_path: Optional[Path] = None, llm_client: Optional[LocalL
             )
             add_audit(connection, session_id, "TRANSFER_TO_HUMAN", reason)
         return get_session(connection, session_id)
+
+    def get_knowledge(connection: Connection, knowledge_id: str) -> Dict[str, Any]:
+        row = connection.execute(
+            "SELECT * FROM knowledge_items WHERE knowledge_id = ?",
+            (knowledge_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="knowledge not found")
+        versions = connection.execute(
+            "SELECT * FROM knowledge_versions WHERE knowledge_id = ? ORDER BY version DESC",
+            (knowledge_id,),
+        ).fetchall()
+        payload = dict(row)
+        payload["versions"] = [dict(version) for version in versions]
+        return payload
 
     def route_customer_message(content: str) -> Dict[str, Any]:
         normalized = content.lower()
@@ -167,6 +223,132 @@ def create_app(database_path: Optional[Path] = None, llm_client: Optional[LocalL
     @app.get("/api/v1/health")
     def health() -> Dict[str, Any]:
         return response({"status": "healthy"})
+
+    @app.post("/api/v1/knowledge")
+    def create_knowledge(payload: KnowledgeInput) -> Dict[str, Any]:
+        knowledge_id = f"kn_{uuid.uuid4().hex[:12]}"
+        version_id = f"knv_{uuid.uuid4().hex[:12]}"
+        timestamp = now()
+        with db() as connection:
+            connection.execute(
+                """
+                INSERT INTO knowledge_items
+                (knowledge_id, title, category, status, current_version, created_by, updated_by, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (knowledge_id, payload.title, payload.category, "DRAFT", 1, "local-admin", "local-admin", timestamp, timestamp),
+            )
+            connection.execute(
+                """
+                INSERT INTO knowledge_versions
+                (version_id, knowledge_id, version, content, status, source_note, effective_from, effective_until, created_by, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (version_id, knowledge_id, 1, payload.content, "DRAFT", payload.source_note, None, None, "local-admin", timestamp),
+            )
+            add_audit(connection, "system", "KNOWLEDGE_CREATED", knowledge_id)
+            knowledge = get_knowledge(connection, knowledge_id)
+        return response(knowledge)
+
+    @app.get("/api/v1/knowledge")
+    def list_knowledge(status: Optional[str] = Query(default=None), category: Optional[str] = Query(default=None)) -> Dict[str, Any]:
+        with db() as connection:
+            query = "SELECT * FROM knowledge_items"
+            conditions = []
+            args = []
+            if status:
+                conditions.append("status = ?")
+                args.append(status)
+            if category:
+                conditions.append("category = ?")
+                args.append(category)
+            if conditions:
+                query += " WHERE " + " AND ".join(conditions)
+            query += " ORDER BY updated_at DESC"
+            rows = connection.execute(query, args).fetchall()
+        return response([dict(row) for row in rows])
+
+    @app.get("/api/v1/knowledge/{knowledge_id}")
+    def read_knowledge(knowledge_id: str) -> Dict[str, Any]:
+        with db() as connection:
+            knowledge = get_knowledge(connection, knowledge_id)
+        return response(knowledge)
+
+    @app.post("/api/v1/knowledge/{knowledge_id}/versions")
+    def create_knowledge_version(knowledge_id: str, payload: KnowledgeVersionInput) -> Dict[str, Any]:
+        version_id = f"knv_{uuid.uuid4().hex[:12]}"
+        timestamp = now()
+        with db() as connection:
+            knowledge = get_knowledge(connection, knowledge_id)
+            latest_version = max((version["version"] for version in knowledge["versions"]), default=0)
+            version = latest_version + 1
+            connection.execute(
+                """
+                INSERT INTO knowledge_versions
+                (version_id, knowledge_id, version, content, status, source_note, effective_from, effective_until, created_by, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (version_id, knowledge_id, version, payload.content, "DRAFT", payload.source_note, None, None, "local-admin", timestamp),
+            )
+            connection.execute(
+                "UPDATE knowledge_items SET updated_by = ?, updated_at = ? WHERE knowledge_id = ?",
+                ("local-admin", timestamp, knowledge_id),
+            )
+            add_audit(connection, "system", "KNOWLEDGE_VERSION_CREATED", f"{knowledge_id}:v{version}")
+            created = connection.execute(
+                "SELECT * FROM knowledge_versions WHERE version_id = ?",
+                (version_id,),
+            ).fetchone()
+        return response(dict(created))
+
+    @app.post("/api/v1/knowledge/{knowledge_id}/publish")
+    def publish_knowledge(knowledge_id: str, payload: KnowledgePublishInput) -> Dict[str, Any]:
+        timestamp = now()
+        with db() as connection:
+            knowledge = get_knowledge(connection, knowledge_id)
+            selected = next((version for version in knowledge["versions"] if version["version"] == payload.version), None)
+            if not selected:
+                raise HTTPException(status_code=404, detail="knowledge version not found")
+            if selected["status"] == "PUBLISHED":
+                return response(knowledge)
+            if selected["status"] != "DRAFT":
+                raise HTTPException(status_code=409, detail="knowledge version cannot be published")
+            connection.execute(
+                "UPDATE knowledge_versions SET status = ?, effective_from = ? WHERE knowledge_id = ? AND status = ?",
+                ("ARCHIVED", timestamp, knowledge_id, "PUBLISHED"),
+            )
+            connection.execute(
+                "UPDATE knowledge_versions SET status = ?, effective_from = ? WHERE knowledge_id = ? AND version = ?",
+                ("PUBLISHED", timestamp, knowledge_id, payload.version),
+            )
+            connection.execute(
+                """
+                UPDATE knowledge_items
+                SET status = ?, current_version = ?, updated_by = ?, updated_at = ?
+                WHERE knowledge_id = ?
+                """,
+                ("PUBLISHED", payload.version, "local-admin", timestamp, knowledge_id),
+            )
+            add_audit(connection, "system", "KNOWLEDGE_PUBLISHED", f"{knowledge_id}:v{payload.version}")
+            published = get_knowledge(connection, knowledge_id)
+        return response(published)
+
+    @app.post("/api/v1/knowledge/{knowledge_id}/archive")
+    def archive_knowledge(knowledge_id: str) -> Dict[str, Any]:
+        timestamp = now()
+        with db() as connection:
+            get_knowledge(connection, knowledge_id)
+            connection.execute(
+                "UPDATE knowledge_items SET status = ?, updated_by = ?, updated_at = ? WHERE knowledge_id = ?",
+                ("ARCHIVED", "local-admin", timestamp, knowledge_id),
+            )
+            connection.execute(
+                "UPDATE knowledge_versions SET status = ? WHERE knowledge_id = ? AND status = ?",
+                ("ARCHIVED", knowledge_id, "PUBLISHED"),
+            )
+            add_audit(connection, "system", "KNOWLEDGE_ARCHIVED", knowledge_id)
+            archived = get_knowledge(connection, knowledge_id)
+        return response(archived)
 
     @app.post("/api/v1/sessions")
     def create_session(payload: SessionInput) -> Dict[str, Any]:
